@@ -3,17 +3,18 @@ package wiresocks
 import (
 	"context"
 	"errors"
+	"github.com/sagernet/sing/common/buf"
 	"io"
 	"log/slog"
 	"net"
 	"net/netip"
+	"syscall"
 	"time"
 
 	"github.com/bepass-org/warp-plus/proxy/pkg/mixed"
 	"github.com/bepass-org/warp-plus/proxy/pkg/statute"
 	"github.com/bepass-org/warp-plus/wireguard/device"
 	"github.com/bepass-org/warp-plus/wireguard/tun/netstack"
-	"github.com/things-go/go-socks5/bufferpool"
 )
 
 // VirtualTun stores a reference to netstack network and DNS configuration
@@ -22,8 +23,11 @@ type VirtualTun struct {
 	Logger *slog.Logger
 	Dev    *device.Device
 	Ctx    context.Context
-	pool   bufferpool.BufPool
+	pool   buf.Allocator
+	//pool bufferpool.BufPool
 }
+
+var BuffSize = 65536
 
 // StartProxy spawns a socks5 server.
 func StartProxy(ctx context.Context, l *slog.Logger, tnet *netstack.Net, bindAddress netip.AddrPort) (netip.AddrPort, error) {
@@ -37,7 +41,7 @@ func StartProxy(ctx context.Context, l *slog.Logger, tnet *netstack.Net, bindAdd
 		Logger: l.With("subsystem", "vtun"),
 		Dev:    nil,
 		Ctx:    ctx,
-		pool:   bufferpool.NewPool(256 * 1024),
+		pool:   buf.DefaultAllocator,
 	}
 
 	proxy := mixed.NewProxy(
@@ -60,11 +64,18 @@ func StartProxy(ctx context.Context, l *slog.Logger, tnet *netstack.Net, bindAdd
 }
 
 func (vt *VirtualTun) generalHandler(req *statute.ProxyRequest) error {
-	vt.Logger.Info("handling connection", "protocol", req.Network, "destination", req.Destination)
+	vt.Logger.Debug("handling connection", "protocol", req.Network, "destination", req.Destination)
 	conn, err := vt.Tnet.Dial(req.Network, req.Destination)
 	if err != nil {
 		return err
 	}
+
+	timeout := 0 * time.Second
+	switch req.Network {
+	case "udp", "udp4", "udp6":
+		timeout = 15 * time.Second
+	}
+
 	// Close the connections when this function exits
 	defer conn.Close()
 	defer req.Conn.Close()
@@ -72,18 +83,24 @@ func (vt *VirtualTun) generalHandler(req *statute.ProxyRequest) error {
 	done := make(chan error, 1)
 	// Copy data from req.Conn to conn
 	go func() {
-		req.Conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-		buf1 := vt.pool.Get()
-		defer vt.pool.Put(buf1)
-		_, err := copyConnTimeout(conn, req.Conn, buf1[:cap(buf1)], 15*time.Second)
+		buf1 := vt.pool.Get(BuffSize)
+		defer func(pool buf.Allocator, buf []byte) {
+			_ = pool.Put(buf)
+		}(vt.pool, buf1)
+		_, err := copyConnTimeout(conn, req.Conn, buf1, timeout)
+		if errors.Is(err, syscall.ECONNRESET) {
+			done <- nil
+			return
+		}
 		done <- err
 	}()
 	// Copy data from conn to req.Conn
 	go func() {
-		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-		buf2 := vt.pool.Get()
-		defer vt.pool.Put(buf2)
-		_, err := copyConnTimeout(req.Conn, conn, buf2[:cap(buf2)], 15*time.Second)
+		buf2 := vt.pool.Get(BuffSize)
+		defer func(pool buf.Allocator, buf []byte) {
+			_ = pool.Put(buf)
+		}(vt.pool, buf2)
+		_, err := copyConnTimeout(req.Conn, conn, buf2, timeout)
 		done <- err
 	}()
 	// Wait for one of the copy operations to finish
@@ -113,7 +130,11 @@ func copyConnTimeout(dst net.Conn, src net.Conn, buf []byte, timeout time.Durati
 	}
 
 	for {
-		if err := src.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		deadline := time.Time{}
+		if timeout != 0 {
+			deadline = time.Now().Add(timeout)
+		}
+		if err := src.SetReadDeadline(deadline); err != nil {
 			return 0, err
 		}
 
